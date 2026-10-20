@@ -165,6 +165,7 @@ class Logger:
         self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {
             "seen": {}, "symbols": {}, "pending": [], "baselined": []}
         self._reconcile_schedules()
+        self.failures = {}                          # source -> (consecutive failures, next allowed attempt time)
 
     # -- persistence --
     def _csv_keys(self, name, cols):
@@ -232,11 +233,28 @@ class Logger:
             self.state["pending"].append(dict(event_id=eid, token=token, offset=off,
                                               due=(t.timestamp() + off)))
 
+    def _blocked(self, source):
+        n, nxt = self.failures.get(source, (0, 0.0))
+        return self.clock().timestamp() < nxt
+
+    def _failed(self, source, e):
+        n = self.failures.get(source, (0, 0.0))[0] + 1
+        wait = 0.0 if n < 5 else min(3600.0, 60.0 * 2 ** (n - 5))   # after 5 straight failures back off (1, 2, 4 ... 60 min)
+        self.failures[source] = (n, self.clock().timestamp() + wait)
+        if n <= 3 or n == 5 or n % 20 == 0:          # do not flood the log with the same error
+            print(f"[{source}] error #{n}: {e}" + (f" (backing off {wait / 60:.0f} min)" if wait else ""))
+
+    def _ok(self, source):
+        self.failures.pop(source, None)
+
     def poll_announcements(self, source, parser):
+        if self._blocked(source):
+            return
         try:
             items = parser(self.fetch(SOURCES[source]))
+            self._ok(source)
         except Exception as e:                      # network or schema error: log and carry on
-            print(f"[{source}] error: {e}")
+            self._failed(source, e)
             return
         seen = set(self.state["seen"].get(source, []))
         first = source not in self.state["baselined"]
@@ -253,10 +271,13 @@ class Logger:
             self.state["baselined"].append(source)
 
     def poll_symbols(self, source, parser):
+        if self._blocked(source):
+            return
         try:
             symbols = parser(self.fetch(SOURCES[source]))
+            self._ok(source)
         except Exception as e:
-            print(f"[{source}] error: {e}")
+            self._failed(source, e)
             return
         prev = set(self.state["symbols"].get(source, []))
         first = source not in self.state["baselined"]
