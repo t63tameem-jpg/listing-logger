@@ -1,0 +1,47 @@
+# Runs the LOG-ONLY meme listing logger in GitHub's cloud so your computer can stay off.
+# Put this file at .github/workflows/listing-logger.yml in a PUBLIC GitHub repo that contains the trading-lab folder
+# (public repos get unlimited free Actions minutes; a private repo would run out in ~2 days). No secrets are used.
+name: listing-logger
+on:
+  schedule:
+    - cron: "5 */6 * * *"      # a new run every 6 hours; each run lasts ~5.5 hours
+  workflow_dispatch: {}
+concurrency:
+  group: listing-logger
+  cancel-in-progress: false
+permissions:
+  contents: write              # lets the job commit the collected CSV files back to the repo
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Collect (public read-only feeds, no orders, no keys)
+        working-directory: trading-lab
+        run: python listing_logger.py --interval 20 --max-minutes 340
+      - name: Keep a recovery copy of the data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: listing-data-${{ github.run_id }}
+          path: trading-lab/data/meme_listings
+          retention-days: 30
+      - name: Save collected data to the repo
+        if: always()
+        working-directory: trading-lab
+        run: |
+          git config user.name "listing-logger"
+          git config user.email "listing-logger@users.noreply.github.com"
+          git add data/meme_listings
+          if git diff --cached --quiet; then echo "nothing new"; exit 0; fi
+          git commit -m "listing logger data $(date -u +%FT%TZ)"
+          for i in 1 2 3 4 5; do
+            git pull --rebase && git push && exit 0
+            sleep $((i * 5))
+          done
+          echo "could not push after 5 tries (data is in the uploaded artifact)"; exit 1
